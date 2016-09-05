@@ -1,0 +1,134 @@
+--- linux-yocto-3.14/mm/slob.c	2015-11-13 14:04:07.653494871 -0800
++++ linux-yocto-x.y.z/mm/slob.c	2015-11-25 18:46:47.273061663 -0800
+@@ -67,7 +67,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/list.h>
+ #include <linux/kmemleak.h>
+-
++#include <linux/linkage.h>
+ #include <trace/events/kmem.h>
+ 
+ #include <linux/atomic.h>
+@@ -101,6 +101,8 @@
+ static LIST_HEAD(free_slob_medium);
+ static LIST_HEAD(free_slob_large);
+ 
++unsigned long slob_page_count = 0;
++
+ /*
+  * slob_page_free: true for pages on free_slob_pages list.
+  */
+@@ -267,8 +269,8 @@
+  */
+ static void *slob_alloc(size_t size, gfp_t gfp, int align, int node)
+ {
+-	struct page *sp;
+-	struct list_head *prev;
++	struct page *sp = NULL;
++	struct page *iterator;
+ 	struct list_head *slob_list;
+ 	slob_t *b = NULL;
+ 	unsigned long flags;
+@@ -282,32 +284,29 @@
+ 
+ 	spin_lock_irqsave(&slob_lock, flags);
+ 	/* Iterate through each partially free page, try to find room */
+-	list_for_each_entry(sp, slob_list, list) {
++	list_for_each_entry(iterator, slob_list, list) {
+ #ifdef CONFIG_NUMA
+ 		/*
+ 		 * If there's a node specification, search for a partial
+ 		 * page with a matching node id in the freelist.
+ 		 */
+-		if (node != NUMA_NO_NODE && page_to_nid(sp) != node)
++		if (node != NUMA_NO_NODE && page_to_nid(&iterator->page) != node)
+ 			continue;
+ #endif
+ 		/* Enough room on this page? */
+-		if (sp->units < SLOB_UNITS(size))
++		if (iterator->units < SLOB_UNITS(size))
+ 			continue;
+ 
++		if (sp == NULL){
++			sp = iterator;
++		}
++		if ( iterator->units < sp->units){
++			sp = iterator;
++		}
++	}
+ 		/* Attempt to alloc */
+-		prev = sp->list.prev;
++	if(sp != NULL){
+ 		b = slob_page_alloc(sp, size, align);
+-		if (!b)
+-			continue;
+-
+-		/* Improve fragment distribution and reduce our average
+-		 * search time by starting our next search here. (see
+-		 * Knuth vol 1, sec 2.5, pg 449) */
+-		if (prev != slob_list->prev &&
+-				slob_list->next != prev->next)
+-			list_move_tail(slob_list, prev->next);
+-		break;
+ 	}
+ 	spin_unlock_irqrestore(&slob_lock, flags);
+ 
+@@ -319,6 +318,8 @@
+ 		sp = virt_to_page(b);
+ 		__SetPageSlab(sp);
+ 
++		slob_page_count++;
++
+ 		spin_lock_irqsave(&slob_lock, flags);
+ 		sp->units = SLOB_UNITS(PAGE_SIZE);
+ 		sp->freelist = b;
+@@ -362,6 +363,8 @@
+ 		__ClearPageSlab(sp);
+ 		page_mapcount_reset(sp);
+ 		slob_free_pages(b, 0);
++		
++		slob_page_count--;
+ 		return;
+ 	}
+ 
+@@ -635,6 +638,7 @@
+ 
+ void __init kmem_cache_init(void)
+ {
++	printk("Initializing SLOB\n");
+ 	kmem_cache = &kmem_cache_boot;
+ 	slab_state = UP;
+ }
+@@ -643,3 +647,35 @@
+ {
+ 	slab_state = FULL;
+ }
++
++asmlinkage long sys_get_slob_amt_free(void)
++{
++	long slob_total = SLOB_UNITS(PAGE_SIZE) * slob_page_count;
++	return slob_total;
++}
++
++asmlinkage long sys_get_slob_amt_claimed(void)
++{
++	long free_units = 0;
++	struct page *sp;
++	struct list_head *slob_list;
++
++	slob_list = &free_slob_small;
++	list_for_each_entry(sp, slob_list, list) {
++		free_units += sp->units;
++	}
++
++	slob_list = &free_slob_medium;
++	list_for_each_entry(sp, slob_list, list) {
++		free_units += sp->units;
++	}
++
++	slob_list = &free_slob_large;
++	list_for_each_entry(sp, slob_list, list) {
++		free_units += sp->units;
++	}
++	return free_units;
++}
